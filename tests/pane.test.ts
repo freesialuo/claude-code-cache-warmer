@@ -154,6 +154,7 @@ test("the Configuration page's Buttons group by row for the arrows, starting at 
       ["toggle:ttl"],
       ["toggle:default"],
       ["toggle:band"],
+      ["toggle:compactGuard"],
       ["idle:5m:-", "idle:5m:+"],
       ["idle:1h:-", "idle:1h:+"],
     ],

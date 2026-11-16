@@ -35,6 +35,7 @@ export type PaneData = {
   isLocked: boolean;
   isDebug: boolean;
   bandStyle: BandStyle;
+  compactGuard: "off" | "manual" | "experimental";
   state: Status;
   totals: Totals;
   allTime: AllTime;
@@ -49,6 +50,7 @@ export type PaneActions = {
   open: (page: Page) => void;
   toggleDebug: () => void;
   setBand: (value: BandStyle) => void;
+  setCompactGuard: (value: "off" | "manual" | "experimental") => void;
   chooseDefault: (value: Ttl) => void;
   chooseSession: (value: Ttl) => void;
   setLimit: (ttl: Ttl, count: number) => void;

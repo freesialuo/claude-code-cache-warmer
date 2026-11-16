@@ -15,6 +15,7 @@ import {
 
 const TTLS = ["5m", "1h"] as const;
 const BAND_STYLES = ["default", "simplified", "off"] as const;
+const COMPACT_GUARD_MODES = ["off", "manual", "experimental"] as const;
 
 // One button for a choice among a few options: it marks the current option and a press picks the next.
 const toggleOf = <T extends string>(
@@ -41,6 +42,7 @@ const LABELS = {
   ttl: "Lifetime",
   default: "Default lifetime",
   band: "Refresh band",
+  compactGuard: "Compact Guard",
   "5m": "Idle refreshes, 5m",
   "1h": "Idle refreshes, 1h",
 };
@@ -55,7 +57,7 @@ const configPageOf = (
   actions: PaneActions,
 ) => {
   const { Box, Text, Button } = elements;
-  const { chosen, saved, limits, bandStyle, isForced, isLocked, state, at } =
+  const { chosen, saved, limits, bandStyle, compactGuard, isForced, isLocked, state, at } =
     data;
   const effective = isForced ? "5m" : chosen;
   const status = statusTextOf(state, at);
@@ -103,6 +105,13 @@ const configPageOf = (
         {label(LABELS.band)}
         {toggleOf(elements, "band", BAND_STYLES, bandStyle, actions.setBand)}
       </Box>
+      <Box key="compactGuard" flexDirection="row">
+        {label(LABELS.compactGuard)}
+        {toggleOf(elements, "compactGuard", COMPACT_GUARD_MODES, compactGuard, actions.setCompactGuard)}
+      </Box>
+      <Text key="compactGuard:note" dimColor>
+        Experimental native compaction; pressure alone never triggers it. Advanced thresholds: /config.
+      </Text>
       {TTLS.map((ttl) => (
         <Box key={`idle:${ttl}`} flexDirection="row">
           {label(LABELS[ttl])}

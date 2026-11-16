@@ -8,6 +8,8 @@ import type {
   MatchedEvent,
   Next,
   Register,
+  PluginOptions,
+  SessionCompactResult,
   StreamNext,
   Timer,
   TurnStepChunk,
@@ -28,6 +30,11 @@ import type {
   Ttl,
   Warming,
 } from "../types";
+import type { CompactOptions } from "./compact";
+import {
+  compactModeOf, compactOptionsOf, forkIsFresh, hasWakeRoom,
+  idlePolicyAllows, idleWakeAt, mainIsStale, readMostOf, validUsage,
+} from "./compact";
 import { MASCOT_ROWS, TERMINAL_DEFAULT, cellsOf } from "./mascot";
 import { paneOf } from "./pages";
 import type { Mascot, PaneActions, PaneData } from "./pane";
@@ -61,6 +68,7 @@ import {
   premiumOf,
   promptTokensOf,
   usageOf,
+  compactionSavingOf,
 } from "./warmer";
 
 const PANE = "cache-warmer";
@@ -70,6 +78,7 @@ const IDLE_KEYS = {
   "1h": "cache-warmer.idle1h",
 } as const;
 const BAND_KEY = "cache-warmer.band";
+const GUARD_KEY = "cache-warmer.compactGuard";
 const ALL_TIME_KEY = "allTime";
 const FORK_PROMPT =
   "[cache-warmer] Automated prompt cache refresh by the cache-warmer plugin, not a message from the user. Reply with the single word ok.";
@@ -133,6 +142,44 @@ const warming = atom({ plugin: "cache-warmer", key: "warming" } as const, {
   isRunning: false,
   outputTokens: DEFAULT_OUTPUT_TOKENS,
 });
+const compactGuard = atom({ plugin: "cache-warmer", key: "compactGuard" } as const, "off");
+const compactPending = atom({ plugin: "cache-warmer", key: "compactPending" } as const, null);
+
+type GuardOperation = {
+  at: number;
+  trigger: string;
+  instructions?: string;
+  anchor: Anchor;
+  phase: "queued" | "waiting" | "ready" | "compacting";
+  text: string;
+  serial: number;
+  accepted: boolean;
+  identified: boolean;
+  wakeTurn?: string;
+  wakeUsage?: import("../types").Usage;
+  wakeSucceeded: boolean;
+  interrupted: boolean;
+  fallback?: string;
+};
+let guardOptions: CompactOptions = compactOptionsOf({});
+let guardValues: PluginOptions = {};
+let guardOperation: GuardOperation | undefined;
+let guardTimer: Timer | undefined;
+let guardTimeout: Timer | undefined;
+let guardBusy: object | undefined;
+let nativeCompactions = 0;
+let activeTurn: string | undefined;
+let userSerial = 0;
+let guardSequence = 0;
+let guardInteractive = false;
+let conversationEpoch = 0;
+let attemptedIdleAnchor: number | undefined;
+
+const invalidateConversation = () => {
+  conversationEpoch += 1;
+  guardBusy = undefined;
+  nativeCompactions = 0;
+};
 
 let timer: Timer | undefined;
 let animation: Timer | undefined;
@@ -167,7 +214,8 @@ type Scene = Pick<Notice, "mood" | "startedAt" | "since">;
 
 type DebugLine =
   | (Omit<Refresh, "at"> & { at: string; phase: "run" | "idle"; ttl: Ttl })
-  | { at: string; reason: string };
+  | { at: string; reason: string }
+  | { at: string; event: "compact-guard"; [key: string]: unknown };
 
 const effectiveTtl = async ($: EngineInterface): Promise<Ttl> =>
   (await read($, isForced)) ? "5m" : read($, ttl);
@@ -242,16 +290,17 @@ const reportStop = async ($: EngineInterface, reason: string) => {
 // only the next prompt's turn.step starts warming again, and the chain's fee
 // is wasted now, since no prompt will judge it.
 const forget = async ($: EngineInterface, reason: string) => {
+  const epoch = conversationEpoch;
   timer?.cancel();
   timer = undefined;
-  const { anchor } = await read($, warming);
-  if (anchor && anchor.feeUsd > 0)
-    await addToTotals($, { wastedUsd: anchor.feeUsd });
-  await update($, warming, (current): Warming => ({
-    ...current,
-    anchor: null,
-  }));
-  await reportStop($, reason);
+  let feeUsd = 0;
+  await update($, warming, (current): Warming => {
+    if (epoch !== conversationEpoch) return current;
+    feeUsd = current.anchor?.feeUsd ?? 0;
+    return { ...current, anchor: null };
+  });
+  if (feeUsd > 0) await addToTotals($, { wastedUsd: feeUsd });
+  if (epoch === conversationEpoch && !(await read($, warming)).anchor) await reportStop($, reason);
 };
 
 // Stops the chain anchored at `at`, adding `feeUsd` to it, until the next
@@ -281,6 +330,7 @@ const stopChain = async (
 // The anchor is read last, so the timer is set from the anchor as it stands:
 // a refresh that settled while an earlier read waited cannot leave a stale one.
 const schedule = async ($: EngineInterface) => {
+  if (guardOperation || guardBusy || nativeCompactions) return;
   const prompt = prompts;
   const limits = await read($, idleLimits);
   const at = await $.clock.now();
@@ -324,6 +374,7 @@ const schedule = async ($: EngineInterface) => {
     phase,
     expectedUsd: decision.expectedUsd,
   }));
+  await scheduleIdleGuard($);
 };
 
 const isPaneOpen = async ($: EngineInterface) =>
@@ -539,6 +590,7 @@ const extend = async (
   current: Anchor,
   entry: Refresh,
   phase: "run" | "idle",
+  confirmed: boolean,
 ) => {
   let isChained = false;
   await update($, warming, (state): Warming => {
@@ -551,6 +603,7 @@ const extend = async (
       anchor: {
         ...anchor,
         lastAt: entry.at,
+        lastForkAt: confirmed ? entry.at : undefined,
         refreshes: anchor.refreshes + 1,
         idleRefreshes: anchor.idleRefreshes + (phase === "idle" ? 1 : 0),
         feeUsd: anchor.feeUsd + (entry.costUsd ?? 0),
@@ -569,13 +622,14 @@ const chain = async (
   current: Anchor,
   entry: Refresh,
   phase: "run" | "idle",
+  confirmed: boolean,
 ) => {
   const costUsd = entry.costUsd ?? 0;
   const isWarmed = entry.result === "warmed";
   const reason =
     entry.result === "expired" ? "cache had expired" : "refresh failed";
   const isChained = isWarmed
-    ? await extend($, current, entry, phase)
+    ? await extend($, current, entry, phase, confirmed)
     : await stopChain($, current.at, reason, costUsd);
   // The anchor holds this refresh now, so scheduling it cannot fork it twice.
   if (forking?.at === current.at) forking = undefined;
@@ -625,7 +679,8 @@ const settle = async (
   );
   // A prompt that arrived during the fork set a new anchor and its own timer;
   // the last idle refresh's warning replaces its notice.
-  await chain($, current, entry, phase);
+  await chain($, current, entry, phase,
+    reply.isAnswered && readMostOf(usage, current.promptTokens));
 };
 
 // The fork rejects when the engine refuses to send it, as for a blocked model; no request went out.
@@ -700,6 +755,7 @@ const forkFor = async (
 // schedule() meanwhile, from a turn that ended, cannot fork it again.
 const refresh = async ($: EngineInterface) => {
   timer = undefined;
+  if (guardOperation || guardBusy || nativeCompactions) return;
   const { anchor: current, isRunning, outputTokens } = await read($, warming);
   if (!current || current.isStopped || current.at === forking?.at) return;
   const claim = { at: current.at };
@@ -709,6 +765,321 @@ const refresh = async ($: EngineInterface) => {
   } finally {
     if (forking === claim) forking = undefined;
   }
+};
+
+const guardLog = async (
+  $: EngineInterface,
+  op: Pick<GuardOperation, "trigger" | "wakeUsage" | "wakeSucceeded" | "fallback"> & { anchor: Anchor | null },
+  answer?: SessionCompactResult, strategy?: string,
+) => {
+  const compactUsage = answer?.skip === undefined && answer && "usage" in answer && answer.usage
+    ? usageOf(answer.usage) : null;
+  await logDebug($, {
+    at: new Date(await $.clock.now()).toISOString(), event: "compact-guard",
+    trigger: op.trigger, strategy: strategy ?? (op.trigger === "idle-prediction" ? "proactive-idle" : "wake-before-compact"),
+    lastMainRequestAt: op.anchor?.at ?? null, lastSuccessfulForkAt: op.anchor?.lastForkAt ?? null,
+    lastMainResponseAt: op.anchor?.lastMainResponseAt ?? null,
+    wakeUsage: op.wakeUsage ?? null, wakeSucceeded: op.wakeSucceeded,
+    nativeCompactionSucceeded: !!answer && answer.skip === undefined,
+    compactionUsage: compactUsage, fallback: op.fallback ?? null,
+    estimatedExtraCostUsd: op.wakeUsage && op.anchor ? costOf(op.anchor.model, op.wakeUsage, op.anchor.ttl) : null,
+    estimatedAvoidedCostUsd: validUsage(compactUsage) && op.anchor ? compactionSavingOf(op.anchor.model, compactUsage) : null,
+    estimateBasis: "API list prices; compaction cache reads versus uncached input, not causal savings",
+  });
+};
+
+const releaseGuard = async ($: EngineInterface, op: GuardOperation, answer?: SessionCompactResult) => {
+  if (guardOperation !== op) return;
+  guardTimeout?.cancel();
+  guardTimer?.cancel();
+  guardOperation = undefined;
+  if (answer && answer.skip === undefined) {
+    invalidateConversation();
+    const forgotten = forget($, "conversation compacted");
+    await update($, compactPending, current => current?.at === op.at ? null : current);
+    await forgotten;
+  } else {
+    // A rejected manual request remains inspectable across a reload. No retry
+    // loop: another plugin's veto and native errors must remain authoritative.
+    if (op.trigger !== "idle-prediction") $.ui.log(`Compact Guard: native compaction did not finish (${answer?.skip ?? op.fallback ?? "unknown"}). Retry /compact${op.instructions ? ` ${op.instructions}` : ""}.`);
+  }
+  await guardLog($, op, answer);
+  if (!guardOperation) await schedule($);
+};
+
+// Context reads are optional checks: a stalled read must not hold a native
+// compaction request or the warmer indefinitely. The late result is ignored.
+const guardContext = async ($: EngineInterface) => {
+  let deadline: Timer | undefined;
+  try {
+    return await Promise.race([
+      $.session.usage({ breakdown: "summary" }),
+      new Promise<never>((_, reject) => {
+        deadline = $.clock.after(guardOptions.timeoutMs, () => reject(new Error("context check timed out")));
+      }),
+    ]);
+  } finally { deadline?.cancel(); }
+};
+
+const queueGuard = ($: EngineInterface) => {
+  guardTimer?.cancel();
+  // turn.complete is delivered before the engine necessarily accepts an idle
+  // compact call. Run outside its hook; a native rejection is surfaced, not retried.
+  guardTimer = $.clock.after(100, () => void runGuard($));
+};
+
+const failGuard = async ($: EngineInterface, op: GuardOperation, reason: string) => {
+  if (guardOperation !== op) return;
+  op.fallback = reason;
+  op.phase = "ready";
+  queueGuard($);
+};
+
+const timeOutGuard = async ($: EngineInterface, op: GuardOperation) => {
+  if (guardOperation !== op || op.phase === "compacting") return;
+  op.fallback = "wake-timeout";
+  op.wakeSucceeded = false;
+  $.ui.log("Compact Guard: Wake timed out; native compaction will wait for the session to be idle.");
+  // Only our identified turn, and never a turn into which a person has typed.
+  if (op.wakeTurn && activeTurn === op.wakeTurn && !op.interrupted) {
+    try { await $.turn.abort({ turnId: op.wakeTurn }); }
+    catch { /* The turn may already have ended. Its completion owns resumption. */ }
+  }
+  // An accepted queued prompt has no cancellation API. Do not race compaction
+  // against it; its actual turn completion (or a native compaction) resolves it.
+  if (!activeTurn && (!op.accepted || op.wakeTurn)) {
+    op.phase = "ready";
+    queueGuard($);
+  }
+};
+
+const runGuard = async ($: EngineInterface) => {
+  const op = guardOperation;
+  if (!op || guardBusy || nativeCompactions || activeTurn) return;
+  const claim = {};
+  guardBusy = claim;
+  try {
+    const mode = await read($, compactGuard);
+    if (mode === "off" || (op.trigger === "idle-prediction" && mode !== "experimental")) {
+      op.fallback = "guard-disabled";
+      if (op.phase === "queued") op.phase = "ready";
+    }
+    if (guardOperation !== op || activeTurn || nativeCompactions || (await read($, warming)).isRunning) return;
+    if (op.phase === "queued") {
+      const at = await $.clock.now();
+      if (op.serial !== userSerial || !forkIsFresh(op.anchor, at, guardOptions.timeoutMs))
+        return await failGuard($, op, "user-arrived-or-cache-expired");
+      const { context } = await guardContext($);
+      const enabled = await read($, compactGuard);
+      const checkedAt = await $.clock.now();
+      if (guardOperation !== op || op.phase !== "queued") return;
+      if (activeTurn || op.serial !== userSerial || enabled === "off" ||
+          (op.trigger === "idle-prediction" && enabled !== "experimental") ||
+          !forkIsFresh(op.anchor, checkedAt, guardOptions.timeoutMs) ||
+          !hasWakeRoom(context, op.anchor, guardOptions.headroom))
+        return await failGuard($, op, "wake-no-longer-safe");
+      op.phase = "waiting";
+      // A plugin's own prompt.submit skips its own prompt.submit hook. Reserve
+      // the unique text here; external submissions still invalidate the serial.
+      op.identified = true;
+      op.accepted = true;
+      guardTimeout = $.clock.after(guardOptions.timeoutMs, () => void timeOutGuard($, op));
+      // The waiting phase owns this submission. A slow submit hook must not
+      // hold the admission lock after its actual turn has completed.
+      if (guardBusy === claim) guardBusy = undefined;
+      // Do not keep the compaction hook open, and do not interpret admission as
+      // a model response. turn.step + turn.complete supply that evidence.
+      const submitted = await $.prompt.submit({ text: op.text });
+      if (guardOperation !== op) return;
+      if (submitted.drop !== undefined) {
+        op.accepted = false;
+        await failGuard($, op, "wake-dropped");
+      }
+      else {
+        op.accepted = true;
+        if (submitted.text !== op.text && !op.wakeTurn) {
+          op.fallback = "wake-rewritten-unidentified";
+          await releaseGuard($, op);
+        }
+      }
+    } else if (op.phase === "ready") {
+      if (op.trigger === "idle-prediction" && (!op.wakeSucceeded || op.interrupted || op.fallback)) {
+        if (guardBusy === claim) guardBusy = undefined;
+        return await releaseGuard($, op);
+      }
+      op.phase = "compacting";
+      if (guardBusy === claim) guardBusy = undefined;
+      const epoch = conversationEpoch;
+      const answer = await $.session.compact({ instructions: op.instructions });
+      if (epoch !== conversationEpoch) {
+        op.fallback = "conversation-changed-during-compaction";
+        return await releaseGuard($, op);
+      }
+      await releaseGuard($, op, answer);
+    }
+  } catch (error) {
+    if (guardOperation !== op) return;
+    const reason = error instanceof Error ? error.message : String(error);
+    if (op.phase === "compacting") {
+      op.fallback = `native-error: ${reason}`;
+      await releaseGuard($, op);
+    } else await failGuard($, op, `wake-api-error: ${reason}`);
+  } finally {
+    if (guardBusy === claim) guardBusy = undefined;
+    if (guardOperation === op && op.phase === "ready") queueGuard($);
+  }
+};
+
+const beginGuard = async (
+  $: EngineInterface, anchor: Anchor, trigger: string, instructions?: string,
+  epoch = conversationEpoch, serial = userSerial,
+) => {
+  const at = await $.clock.now();
+  if (epoch !== conversationEpoch || serial !== userSerial || activeTurn || nativeCompactions || guardOperation) return false;
+  const op: GuardOperation = {
+    at, trigger, instructions, anchor, phase: "queued", serial: userSerial,
+    text: `[cache-warmer compact guard ${++guardSequence}:${at}] Refresh this conversation before native compaction. Reply only: ready. Do not use tools.`,
+    accepted: false, identified: false, wakeSucceeded: false, interrupted: false,
+  };
+  guardOperation = op;
+  timer?.cancel();
+  guardTimer?.cancel();
+  if (trigger !== "idle-prediction")
+    await update($, compactPending, current => guardOperation === op ? ({ at, trigger, instructions }) : current);
+  if (guardOperation === op) queueGuard($);
+  return true;
+};
+
+const idleSnapshot = async ($: EngineInterface) => {
+  const { context } = await guardContext($);
+  const enabled = await $.settings.read({ key: "idleCompaction" });
+  const minimum = await $.env.get("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS");
+  return { context, enabled, minimum };
+};
+
+const tryIdleGuard = async ($: EngineInterface) => {
+  if (guardOperation || guardBusy || nativeCompactions || activeTurn) return;
+  const claim = {};
+  guardBusy = claim;
+  try {
+    const epoch = conversationEpoch;
+    const { anchor: current, isRunning } = await read($, warming);
+    if (isRunning || !current || current.isStopped || current.at === attemptedIdleAnchor ||
+        await read($, compactGuard) !== "experimental") return;
+    const serial = userSerial;
+    const { context, enabled, minimum } = await idleSnapshot($);
+    const at = await $.clock.now();
+    if (activeTurn || serial !== userSerial || (await read($, warming)).anchor?.at !== current.at ||
+        !idlePolicyAllows(current, context, guardOptions, enabled, minimum, guardInteractive) ||
+        at < idleWakeAt(current, guardOptions) || at >= current.at + TTL_MS["1h"] ||
+        !forkIsFresh(current, at, guardOptions.timeoutMs)) return;
+    attemptedIdleAnchor = current.at;
+    await beginGuard($, current, "idle-prediction", undefined, epoch, serial);
+  } catch {
+    // Missing APIs/settings/usage disable the experimental path, not warming.
+  } finally { if (guardBusy === claim) guardBusy = undefined; }
+};
+
+const scheduleIdleGuard = async ($: EngineInterface) => {
+  if (guardOperation || guardBusy || nativeCompactions || activeTurn ||
+      await read($, compactGuard) !== "experimental") return;
+  guardTimer?.cancel();
+  const { anchor } = await read($, warming);
+  if (!anchor || anchor.isStopped || anchor.ttl !== "1h" || !anchor.lastForkAt ||
+      attemptedIdleAnchor === anchor.at) return;
+  const at = await $.clock.now();
+  const due = idleWakeAt(anchor, guardOptions);
+  if (at >= anchor.at + TTL_MS["1h"]) return;
+  guardTimer = $.clock.after(Math.max(0, due - at), () => void tryIdleGuard($));
+};
+
+const onCompact: Hook<"session.compact"> = async ($, e, next) => {
+  if (e.agentId !== undefined || e.trigger === "precompute") return next(e);
+  if (guardOperation?.phase === "compacting" && e.trigger === "plugin" && next.origin.plugin === "cache-warmer") return next(e);
+  const epoch = conversationEpoch;
+  const mode = await read($, compactGuard);
+  if (mode !== "off" && (e.trigger === "manual" || e.trigger === "plugin")) {
+    if (guardOperation)
+      return { skip: "Compact Guard already has a pending request; its original instructions are retained. Retry a different request after it finishes." };
+    if (guardBusy || nativeCompactions)
+      return { skip: "Another compaction request is being checked or running. Retry this request after it finishes." };
+    if (!guardBusy && !activeTurn && !nativeCompactions && !forking) {
+      const claim = {};
+      guardBusy = claim;
+      try {
+        const serial = userSerial;
+        const { anchor: current, isRunning } = await read($, warming);
+        const at = await $.clock.now();
+        if (!isRunning && current && mainIsStale(current, at) && forkIsFresh(current, at, guardOptions.timeoutMs)) {
+          const { context } = await guardContext($);
+          if (!activeTurn && serial === userSerial && hasWakeRoom(context, current, guardOptions.headroom)) {
+            if (await beginGuard($, current, e.trigger, e.instructions, epoch, serial))
+              return { skip: "Compact Guard deferred native compaction for one main-thread Wake; original instructions are retained." };
+          }
+        }
+      } catch { /* Unsupported or uncertain: preserve the native request. */ }
+      finally { if (guardBusy === claim) guardBusy = undefined; }
+    }
+  }
+  if (epoch !== conversationEpoch)
+    return { skip: `The conversation changed during the cache check. Retry /compact${e.instructions ? ` ${e.instructions}` : ""} if still needed.` };
+  nativeCompactions += 1;
+  timer?.cancel();
+  guardTimer?.cancel();
+  const pendingAtEntry = guardOperation;
+  let nativeAnchor: Anchor | null = null;
+  try {
+    if (mode !== "off") nativeAnchor = (await read($, warming)).anchor;
+    const answer = await next(e);
+    if (epoch !== conversationEpoch) return answer;
+    if (answer.skip === undefined) {
+      const op = guardOperation;
+      if (op) {
+        op.fallback = "native-compaction-overtook-wake";
+        await releaseGuard($, op, answer);
+      } else {
+        invalidateConversation();
+        const forgotten = forget($, "conversation compacted");
+        await update($, compactPending, () => null);
+        await forgotten;
+      }
+    }
+    if (mode !== "off" && !pendingAtEntry) await guardLog($, {
+      trigger: e.trigger, anchor: nativeAnchor, wakeSucceeded: false,
+      fallback: "native-path: Wake unsafe, unnecessary, or trigger not interceptable",
+    }, answer, "native");
+    return answer;
+  } catch (error) {
+    if (mode !== "off") await guardLog($, {
+      trigger: e.trigger, anchor: nativeAnchor, wakeSucceeded: false, fallback: "native-error",
+    }, undefined, "native");
+    throw error;
+  } finally {
+    if (epoch === conversationEpoch) {
+      nativeCompactions -= 1;
+      if (guardOperation) queueGuard($);
+      else await schedule($);
+    }
+  }
+};
+
+const setCompactGuard = async ($: EngineInterface, value: import("./compact").CompactMode) => {
+  const answer = await $.config.set({ key: GUARD_KEY, value });
+  if (answer.deny !== undefined) return logDenied($, "Compact Guard", answer.deny);
+  await update($, compactGuard, () => compactModeOf(answer.value));
+  guardOptions.mode = compactModeOf(answer.value);
+  guardValues = { ...guardValues, compactGuard: guardOptions.mode };
+  if (!guardOperation) await scheduleIdleGuard($);
+};
+
+const setGuardThreshold: Hook<"config.set"> = async ($, e, next) => {
+  const answer = await next(e);
+  if (answer.deny === undefined) {
+    guardValues = { ...guardValues, [e.key.slice("cache-warmer.".length)]: answer.value };
+    guardOptions = compactOptionsOf(guardValues);
+    if (!guardOperation) await scheduleIdleGuard($);
+  }
+  return answer;
 };
 
 const setTtl = async ($: EngineInterface, value: Ttl) => {
@@ -942,11 +1313,21 @@ const stepTurn = async function* (
   next: StreamNext<"turn.step">,
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   if (e.agentId !== undefined) return yield* next(e);
+  const epoch = conversationEpoch;
   const at = await $.clock.now();
   const before = (await read($, warming)).anchor;
   // The lifetime this request is sent with; a choice made while it runs applies to the next one.
   const entryTtl = await effectiveTtl($);
   const result = yield* next(e);
+  if (epoch !== conversationEpoch || (activeTurn && activeTurn !== e.turnId)) return result;
+  const responseAt = await $.clock.now();
+  const op = guardOperation;
+  if (op?.wakeTurn === e.turnId && result.usage) {
+    op.wakeUsage = usageOf(result.usage);
+    op.wakeSucceeded = e.index === 0 && result.stopReason === "end_turn" &&
+      result.toolUses.length === 0 && readMostOf(op.wakeUsage, op.anchor.promptTokens) && !op.fallback;
+    if (!op.wakeSucceeded) op.fallback ??= "wake-cache-miss-or-incomplete";
+  }
   if (!result.usage) return result;
   await update($, isLocked, () => true);
   const usage = usageOf(result.usage);
@@ -958,11 +1339,13 @@ const stepTurn = async function* (
   const after = (await read($, warming)).anchor;
   const isSameChain = before !== null && after?.at === before.at;
   const model = result.usage.model;
-  await update($, warming, (current): Warming => ({
+  await update($, warming, (current): Warming => epoch !== conversationEpoch || (activeTurn && activeTurn !== e.turnId) ? current : ({
     ...current,
     anchor: {
       at,
       lastAt: at,
+      lastMainResponseAt: responseAt,
+      lastForkAt: isSameChain && after.lastForkAt !== before.lastForkAt ? after.lastForkAt : undefined,
       model,
       promptTokens: promptTokensOf(usage),
       ttl: entryTtl,
@@ -983,6 +1366,13 @@ const stepTurn = async function* (
 // way, or a notice shown since, keeps its place. A held notice's timer finds it gone.
 const onTurnStart: Hook<"turn.start"> = async ($, e, next) => {
   if (e.agentId !== undefined) return next(e);
+  activeTurn = e.turnId;
+  const op = guardOperation;
+  if (op?.phase === "waiting" && op.identified && e.text === op.text) op.wakeTurn = e.turnId;
+  else {
+    userSerial += 1;
+    if (op) { op.interrupted = true; op.fallback ??= "user-or-other-turn-arrived"; }
+  }
   prompts += 1;
   const prompt = prompts;
   await update($, warming, (current): Warming => ({
@@ -997,14 +1387,27 @@ const onTurnStart: Hook<"turn.start"> = async ($, e, next) => {
 };
 
 const onTurnComplete: Hook<"turn.complete"> = async ($, e, next) => {
-  if (e.agentId === undefined) {
+  const epoch = conversationEpoch;
+  const answer = await next(e);
+  if (e.agentId === undefined && (!activeTurn || activeTurn === e.turnId)) {
+    if (activeTurn === e.turnId) activeTurn = undefined;
     await update($, warming, (current): Warming => ({
       ...current,
       isRunning: false,
     }));
-    await schedule($);
+    const op = guardOperation;
+    if (op && (op.wakeTurn === e.turnId || (op.interrupted && op.phase !== "waiting"))) {
+      if (op.wakeTurn !== e.turnId || e.isAborted || e.reason !== "answer" || !op.wakeUsage) {
+        op.wakeSucceeded = false;
+        op.fallback ??= "wake-failed-or-missing-usage";
+      }
+      guardTimeout?.cancel();
+      op.phase = "ready";
+      queueGuard($);
+    }
+    if (epoch === conversationEpoch) await schedule($);
   }
-  return next(e);
+  return answer;
 };
 
 // /config saves the default whatever the lock; applyDefault decides whether this session follows.
@@ -1070,6 +1473,7 @@ const renderPane = async (
     isLocked: await read($, isLocked),
     isDebug: debugOn,
     bandStyle: await read($, bandStyle),
+    compactGuard: await read($, compactGuard),
     state: await read($, status),
     totals: await read($, totals),
     allTime: await read($, allTime),
@@ -1094,6 +1498,7 @@ const renderPane = async (
     open: (next) => void update($, page, () => next),
     toggleDebug: () => void update($, isDebug, (current) => !current),
     setBand: (value) => void setBand($, value),
+    setCompactGuard: (value) => void setCompactGuard($, value),
     chooseDefault: (value) => void chooseDefault($, value),
     chooseSession: (value) => void chooseSessionTtl($, value),
     setLimit: (limitTtl, count) => void setLimit($, limitTtl, count),
@@ -1126,6 +1531,8 @@ const arrowToFocus = async (
 };
 
 export const register: Register = (on, options) => {
+  guardValues = options;
+  guardOptions = compactOptionsOf(options);
   const chosen = String(options.ttl);
   const option = isTtl(chosen) ? chosen : "1h";
   const limits = {
@@ -1134,6 +1541,10 @@ export const register: Register = (on, options) => {
   };
   const band = bandStyleOf(options.band);
   on("session.start", async ($, e, next) => {
+    guardInteractive = e.isInteractive;
+    await update($, compactGuard, () => guardOptions.mode);
+    const pending = await read($, compactPending);
+    if (pending) $.ui.log(`Compact Guard: a deferred request was interrupted by reload. Retry /compact${pending.instructions ? ` ${pending.instructions}` : ""}.`);
     await startSession($, option, limits, band);
     return next(e);
   });
@@ -1153,18 +1564,59 @@ export const register: Register = (on, options) => {
       await applyBand($, bandStyleOf(answer.value));
     return answer;
   });
+  on("config.set", { key: GUARD_KEY }, async ($, e, next) => {
+    const answer = await next({ ...e, value: compactModeOf(e.value) });
+    if (answer.deny === undefined) {
+      guardOptions.mode = compactModeOf(answer.value);
+      guardValues = { ...guardValues, compactGuard: guardOptions.mode };
+      await update($, compactGuard, () => guardOptions.mode);
+      if (!guardOperation) await scheduleIdleGuard($);
+    }
+    return answer;
+  });
+  on("config.set", { key: "cache-warmer.compactMinPercent" }, setGuardThreshold);
+  on("config.set", { key: "cache-warmer.compactHeadroomTokens" }, setGuardThreshold);
+  on("config.set", { key: "cache-warmer.compactLeadSeconds" }, setGuardThreshold);
+  on("config.set", { key: "cache-warmer.compactWakeTimeoutSeconds" }, setGuardThreshold);
+  on("prompt.submit", async ($, e, next) => {
+    const op = guardOperation;
+    if (op && e.origin.kind === "plugin" && e.origin.name === "cache-warmer" && e.text === op.text) {
+      if (activeTurn || op.serial !== userSerial || op.fallback) return { drop: "Compact Guard Wake is no longer safe." };
+      op.identified = true;
+    } else {
+      userSerial += 1;
+      if (op) {
+        op.interrupted = true;
+        op.fallback = "user-or-other-prompt-arrived";
+        if (op.phase === "queued") op.phase = "ready";
+      }
+    }
+    return next(e);
+  });
   on("turn.start", onTurnStart);
+  on("tool.check", ($, e, next) => {
+    const op = guardOperation;
+    if (e.agentId === undefined && op?.wakeTurn === activeTurn && op?.wakeTurn && !op.interrupted) {
+      op.fallback = "wake-attempted-tool";
+      op.wakeSucceeded = false;
+      return { decision: "deny", reason: "Compact Guard Wake only refreshes the cache; no tools are needed." };
+    }
+    return next(e);
+  });
   on("turn.step", async function* ($, e, next) {
     return yield* stepTurn($, e, next);
   });
   on("turn.complete", onTurnComplete);
-  on("session.compact", async ($, e, next) => {
-    const answer = await next(e);
-    if (e.agentId === undefined) await forget($, "conversation compacted");
-    return answer;
-  });
+  on("session.compact", onCompact);
   // Every ending forgets the chain, so its fee is settled before the process can exit.
   on("session.end", async ($, e, next) => {
+    guardTimer?.cancel();
+    guardTimeout?.cancel();
+    if (guardOperation) $.ui.log(`Compact Guard: session ended with compaction pending. Retry /compact${guardOperation.instructions ? ` ${guardOperation.instructions}` : ""} after resuming.`);
+    guardOperation = undefined;
+    activeTurn = undefined;
+    invalidateConversation();
+    if (e.reason === "clear") await update($, compactPending, () => null);
     if (e.reason !== "clear") await forget($, "session ended");
     else {
       await forget($, "conversation cleared");
@@ -1175,7 +1627,17 @@ export const register: Register = (on, options) => {
     return next(e);
   });
   on("classic.PostModelSwitch", async ($, e, next) => {
+    invalidateConversation();
+    const op = guardOperation;
+    if (op) {
+      op.fallback = "model-switched";
+      op.wakeSucceeded = false;
+      // An admitted Wake has no queue cancellation API. Wait for its own
+      // completion; a request not yet submitted can use native fallback.
+      if (op.phase === "queued") op.phase = "ready";
+    }
     await forget($, "model switched");
+    if (guardOperation === op && op?.phase === "ready") queueGuard($);
     return next(e);
   });
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {

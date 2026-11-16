@@ -34,6 +34,45 @@
       "min": 0,
       "max": 20
     },
+    "compactGuard": {
+      "type": "string",
+      "title": "Compact Guard",
+      "description": "Off by default. Manual keeps native compaction under user control; experimental may request native compaction before cache expiry only when all guards pass. Minimum context pressure alone never triggers compaction.",
+      "default": "off",
+      "options": ["off", "manual", "experimental"]
+    },
+    "compactMinPercent": {
+      "type": "number",
+      "title": "Compact minimum pressure (%)",
+      "description": "Minimum context pressure for experimental native compaction; this threshold alone never triggers compaction.",
+      "default": 80,
+      "min": 50,
+      "max": 95
+    },
+    "compactHeadroomTokens": {
+      "type": "number",
+      "title": "Compact headroom tokens",
+      "description": "Required context headroom for experimental native compaction; all other guards must also pass.",
+      "default": 16000,
+      "min": 4096,
+      "max": 100000
+    },
+    "compactLeadSeconds": {
+      "type": "number",
+      "title": "Compact lead time (seconds)",
+      "description": "Lead time before cache expiry for experimental native compaction; all other guards must also pass.",
+      "default": 60,
+      "min": 15,
+      "max": 300
+    },
+    "compactWakeTimeoutSeconds": {
+      "type": "number",
+      "title": "Compact wake timeout (seconds)",
+      "description": "Maximum wait for the experimental native-compaction wake request; a timeout does not permit retrying compaction automatically.",
+      "default": 30,
+      "min": 5,
+      "max": 120
+    },
     "band": {
       "type": "string",
       "title": "Refresh band",

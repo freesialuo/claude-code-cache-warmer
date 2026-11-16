@@ -191,6 +191,13 @@ export const premiumOf = (model: string, usage: Usage): number | null => {
   );
 };
 
+// Estimate against uncached summary input, not a cache rewrite. This is not
+// proof that the guard caused these reads; native compaction may read them too.
+export const compactionSavingOf = (model: string, usage: Usage): number | null => {
+  const p = rates(model, promptTokensOf(usage));
+  return p ? usage.cacheRead * (p.input - p.cacheRead) / 1_000_000 : null;
+};
+
 // What losing the entry adds to the next prompt: writing the prefix again instead of reading it.
 export const missCostOf = (
   model: string,

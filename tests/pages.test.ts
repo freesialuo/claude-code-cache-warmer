@@ -19,6 +19,29 @@ const clear = {
   resume: { id: "s1" },
 } as const;
 
+test("Compact Guard cycles modes and saves configuration", async ($, on) => {
+  const { configSets } = world(on);
+  await start($);
+  const pane = await mountPane($, "terminal");
+  await pane.press({ key: "menu:config" });
+  expect(await pane.find({ key: "toggle:compactGuard" })).toMatchObject({
+    props: { label: "● off  ○ manual  ○ experimental" },
+  });
+  for (const label of [
+    "○ off  ● manual  ○ experimental",
+    "○ off  ○ manual  ● experimental",
+    "● off  ○ manual  ○ experimental",
+  ]) {
+    await pane.press({ key: "toggle:compactGuard" });
+    expect(await pane.find({ key: "toggle:compactGuard" })).toMatchObject({
+      props: { label },
+    });
+  }
+  expect(configSets).toEqual(["manual", "experimental", "off"]);
+  expect(await pane.find({ text: /Advanced thresholds: \/config\./ })).toBeDefined();
+  await pane.unmount();
+});
+
 test("each menu item opens its page, Back returns to the menu, and reopening starts there", async ($, on) => {
   world(on, { HOME: "/home/t" });
   await start($);

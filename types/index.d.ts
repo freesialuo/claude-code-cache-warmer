@@ -82,6 +82,9 @@ export type BandStyle = "default" | "simplified" | "off";
 export type Anchor = {
   at: number;
   lastAt: number;
+  lastMainResponseAt?: number;
+  // Last answered fork that read at least 90% of this prefix, at request start.
+  lastForkAt?: number;
   model: string;
   promptTokens: number;
   ttl: Ttl;
@@ -123,6 +126,9 @@ declare module "claude-code" {
       allTime: AllTime;
       now: number;
       warming: Warming;
+      compactGuard: "off" | "manual" | "experimental";
+      // Survives a module reload; never contains a replacement transcript.
+      compactPending: { instructions?: string; trigger: string; at: number } | null;
     };
   }
 }
