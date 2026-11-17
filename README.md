@@ -160,27 +160,28 @@ Choose a mode on the Configuration page or in `/config` under `cache-warmer.comp
 
 The manual guard applies only when the last main-thread request is older than its effective cache TTL, a successful recent fork still supports a warm prefix, the session is idle, and measured context usage leaves enough room. Otherwise the original compaction proceeds. Its short prompt identifies cache-warmer as the sender and asks for a minimal reply without tools. The guard waits for actual model usage and `turn.complete`; prompt admission alone is not completion. This wake enters the conversation and is billed like any turn. Native compaction generates the summary; the plugin does not replace transcripts or implement its own summarizer.
 
-The experimental path estimates native idle compaction at **about one hour** after the last main-thread request. It can wake shortly before that estimate and request native compaction only when all these conditions hold:
+The experimental path uses a conservative **50-minute estimate from the last main-thread request's start**. Native documentation says [about an hour](https://code.claude.com/docs/en/settings-reference#idlecompaction), and the [changelog](https://code.claude.com/docs/en/changelog) reports about **54 minutes**; no public API exposes its deadline. Forks and response completion do not advance the guard's estimate. It can wake and request native compaction only when all these conditions hold:
 
-- An interactive, idle session with an effective **1-hour TTL**, and `idleCompaction` explicitly set to `true`. The plugin only reads this setting; an unset value intentionally skips this path.
-- Known context breakdown, auto-compaction enabled, and at least **80%** of the raw context window used by default. Usage must also reach the native idle minimum: normally 200,000 tokens, and never below 100,000 for this guard.
-- At least **16,000 tokens** of default headroom below both the hard context limit and the auto-compaction threshold.
-- A recent successful fork that read at least **90%** of the prior prefix, with enough cache lifetime left for the wake timeout.
-- The clock is within the default **60 seconds** before the estimated idle boundary. There is at most one attempt per main-request anchor; starting it cancels the next fork refresh.
+- An interactive, idle session with an effective **1-hour TTL**, and native idle compaction enabled. An unset `idleCompaction` uses the native default, `true`; the plugin only reads it.
+- Known context breakdown, auto-compaction enabled, and usage at the native idle minimum: normally **200,000 tokens**. A valid `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` overrides this, with a **100,000-token floor**; invalid values use the native default.
+- At least **16,000 tokens** of default headroom below both the context limit and the ordinary auto-compaction threshold.
+- Successful main-request cache usage or a recent successful fork supports at least **90%** of the prior prefix, with enough cache lifetime left for the wake timeout. This permits a wake before the first fork.
+- The wake is scheduled at the estimate minus the lead and timeout budgets: **48m30s** by default. It is skipped if its timeout budget would cross the estimate. There is at most one attempt per main-request anchor; starting it cancels the next fork refresh.
 
-This is an idle-time estimate, not a generic predictor of automatic compaction. Context pressure alone never starts it. Automatic, context-limit, precompute, and subagent compactions are never vetoed by this guard. A successful native compaction overtaking a pending wake suppresses a second compaction. No precompute workaround is installed.
+This experimental timing is independent of ordinary fork refreshes and context pressure. Automatic, context-limit, precompute, and subagent compactions are never vetoed. A successful native compaction overtaking a pending wake suppresses a second compaction. No precompute workaround is installed.
 
 | `/config` option | Default | Range |
 |---|---|---|
 | `cache-warmer.compactGuard` | `off` | `off`, `manual`, `experimental` |
-| `cache-warmer.compactMinPercent` | `80` | 50–95 |
 | `cache-warmer.compactHeadroomTokens` | `16000` | 4096–100000 |
 | `cache-warmer.compactLeadSeconds` | `60` | 15–300 |
 | `cache-warmer.compactWakeTimeoutSeconds` | `30` | 5–120 |
 
-The pressure and lead options govern the experimental path; headroom and wake timeout also protect manual deferral. For example, select `manual` for requested compactions, or `experimental` with `compactMinPercent = 85` and `compactLeadSeconds = 120` for a more restrictive idle policy. `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`, if already configured, is read as a complementary idle threshold. Changing it is optional and unnecessary for the manual guard. Do not run Cache Keeper alongside Cache Warmer.
+Lead time governs the experimental schedule; headroom and wake timeout also protect manual deferral. Changing the native idle minimum is optional and unnecessary for the manual guard. Do not run Cache Keeper alongside Cache Warmer.
 
-If a wake fails, manual mode still attempts the requested native compaction once the session is idle; experimental mode abandons its proactive request and resumes ordinary warming. Another plugin's veto or a native error is surfaced without a retry loop. A queued prompt cannot always be safely retracted, so a timeout may still wait for the real turn to finish. If another plugin rewrites the Wake so its turn cannot be identified, the guard releases the request and displays the original instructions for a manual retry. Reload or session interruption can also leave a deferred manual request unfinished; the plugin surfaces the retained instructions so you can retry `/compact` yourself.
+`compactMinPercent` has been removed: idle eligibility no longer requires proximity to the capacity limit. No separate capacity-pressure compaction policy is introduced, and the native Auto Compact threshold is unchanged.
+
+When a wake fails conclusively, manual mode attempts the requested native compaction once idle; experimental mode abandons its proactive request. Another plugin's veto or a native error is surfaced without a retry loop. An outstanding or accepted Wake that has not started by the timeout enters recovery: warming and new Wakes pause, and no automatic follow-up compaction runs. This state survives plugin reloads until that exact Wake finishes or its submission confirms `{ drop }`. The [public API](https://code.claude.com/docs/en/plugins/mods/api#work-your-mod-started-before-the-interruption) cannot inspect or cancel its queued prompt. If it never starts, **restart Claude Code**, then manually retry `/compact` with the original instructions shown in the recovery notice. An unidentifiable rewritten Wake also requires recovery. Late Wake callbacks preserve a newer user warming chain; native automatic compaction remains allowed.
 
 Forks keeping server cache entries warm while compaction's local cache tracking falls behind is a [reported Claude Code issue](https://github.com/anthropics/claude-code/issues/105017). The report attributes this to stale timestamps enabling `skipMessageCacheMarkers`; that internal explanation is unverified for current builds. A successful wake does not guarantee the summarizer will reuse the cache. The implementation uses the documented [mod API](https://code.claude.com/docs/en/plugins/mods/api), [TypeScript contract](https://github.com/anthropics/claude-code/blob/main/mods/types/claude-code.d.ts), and [hook lifecycle](https://code.claude.com/docs/en/plugins/mods/reference); native [idle compaction settings](https://code.claude.com/docs/en/settings-reference#idlecompaction) remain authoritative. Organization controls can disable `session.compact` hooks; manual interception then cannot operate. No private runtime patches or automatic global configuration changes are used.
 
@@ -193,7 +194,7 @@ The mod also appends one JSON line per refresh and per stop to `<config>/cache-w
 
 Compact Guard appends an `event: "compact-guard"` record there with its trigger and strategy, last main-request and successful-fork times, wake and compaction token usage, wake success, native compaction success, and fallback reason. `estimatedExtraCostUsd` estimates the wake's cost; `estimatedAvoidedCostUsd` compares observed compaction cache reads with uncached input. Both use API list prices. They are separate estimates, not proof that the guard caused a saving or cache hit.
 
-To validate a real run, enable Debug mode, wait for a successful fork, then request `/compact` after the main-thread TTL has elapsed while that fork is still fresh. Inspect the **compaction's own** `compactionUsage.cacheRead`, `cacheWrite`, and `input`, and compare `cacheRead` with their sum. Check `wakeUsage` separately. Null usage (including a reused precomputed summary) proves no cache hit. Tests use mocked API usage; live cache reuse and prevention of native automatic compaction have not been verified. Guard cost estimates are logged separately from the existing fork analytics totals.
+To validate a real run, enable Debug mode, wait for a successful fork, then request `/compact` after the main-thread TTL has elapsed while that fork is still fresh. Inspect the **compaction's own** `compactionUsage.cacheRead`, `cacheWrite`, and `input`, and compare `cacheRead` with their sum. Check `wakeUsage` separately. Null usage (including a reused precomputed summary) provides no cache-hit evidence. Deterministic tests include a competing native compaction at 54 minutes; their API usage is mocked. Live summarizer cache reuse and timing against native idle compaction remain unverified. Guard cost estimates are logged separately from the existing fork analytics totals.
 
 > ⚠️ The mod cannot see `/rewind`.
 > After a rewind, refreshes keep the later prefix warm until the next request.
@@ -212,7 +213,7 @@ Each refresh is a fork of the main conversation's last request, sent to the same
 | Sends | Fork refreshes, plus a main-thread wake and native compaction when the optional guard runs. No telemetry. |
 | Bills | Refreshes, guard wakes, and compaction count against your Claude plan or API key, like any request. |
 | Sets | `CLAUDE_CODE_PROMPT_CACHE_TTL` for the running Claude Code process |
-| Stores | All-time totals in the plugin store; pending compaction metadata in session state for hot reloads; refresh notices and optional guard turns in the transcript; debug logs while enabled |
+| Stores | All-time totals in the plugin store; pending compaction and uncertain Wake metadata in session state for hot reloads; refresh notices and optional guard turns in the transcript; debug logs while enabled |
 | Stops | Set both idle limits to 0 to stop idle refreshes. Disable the plugin to stop all refreshes. |
 
 <br>

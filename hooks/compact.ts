@@ -5,7 +5,6 @@ import { TTL_MS } from "./warmer";
 export type CompactMode = "off" | "manual" | "experimental";
 export type CompactOptions = {
   mode: CompactMode;
-  minPercent: number;
   headroom: number;
   leadMs: number;
   timeoutMs: number;
@@ -20,7 +19,6 @@ const bounded = (value: ConfigValue | undefined, fallback: number, min: number, 
 
 export const compactOptionsOf = (options: PluginOptions): CompactOptions => ({
   mode: compactModeOf(options.compactGuard),
-  minPercent: bounded(options.compactMinPercent, 80, 50, 95),
   headroom: bounded(options.compactHeadroomTokens, 16_000, 4096, 100_000),
   leadMs: bounded(options.compactLeadSeconds, 60, 15, 300) * 1000,
   timeoutMs: bounded(options.compactWakeTimeoutSeconds, 30, 5, 120) * 1000,
@@ -42,6 +40,13 @@ export const forkIsFresh = (anchor: Anchor, at: number, margin: number) =>
 export const mainIsStale = (anchor: Anchor, at: number) =>
   at >= Math.max(anchor.at, anchor.lastMainResponseAt ?? anchor.at) + TTL_MS[anchor.ttl];
 
+// A successful main request can establish a warm prefix before the first Fork.
+// Its request-start time is deliberately conservative about server expiry.
+export const idleCacheIsFresh = (anchor: Anchor, at: number, margin: number) =>
+  forkIsFresh(anchor, at, margin) ||
+  (anchor.mainCacheAt !== undefined && anchor.mainCacheAt <= at &&
+    at + margin < anchor.mainCacheAt + TTL_MS[anchor.ttl]);
+
 // A plain status-line percentage omits a smaller auto-compact window. Require
 // the documented local /context estimate and leave room below BOTH limits.
 export const hasWakeRoom = (context: SessionContextUsage, anchor: Anchor, headroom: number) => {
@@ -55,21 +60,23 @@ export const hasWakeRoom = (context: SessionContextUsage, anchor: Anchor, headro
   return limit - Math.max(b.totalTokens, anchor.promptTokens) >= headroom;
 };
 
-// Native idle timing is documented only as "about an hour". This is an
-// explicitly experimental estimate, never an interception guarantee.
+// No public deadline API. Docs say "about an hour" and some versions report
+// about 54 minutes. Use 50 minutes conservatively, independent of cache TTL.
+// Forks never advance this main-request-based estimate.
+export const idleDeadline = (anchor: Anchor) => anchor.at + 50 * 60_000;
 export const idleWakeAt = (anchor: Anchor, options: CompactOptions) =>
-  anchor.at + TTL_MS["1h"] - options.leadMs;
+  idleDeadline(anchor) - options.leadMs - options.timeoutMs;
 
 export const idlePolicyAllows = (
   anchor: Anchor, context: SessionContextUsage, options: CompactOptions,
   idleEnabled: unknown, idleMinTokens: string | undefined, interactive: boolean,
 ) => {
-  const minimum = idleMinTokens === undefined ? 200_000 : Number(idleMinTokens);
+  const configured = Number(idleMinTokens);
+  const minimum = Number.isInteger(configured) && configured > 0 ? Math.max(100_000, configured) : 200_000;
   const b = context.breakdown;
   return options.mode === "experimental" && interactive && anchor.ttl === "1h" &&
-    idleEnabled === true && Number.isInteger(minimum) && minimum > 0 &&
+    (idleEnabled === true || idleEnabled === undefined) &&
     !!b?.isAutoCompactEnabled &&
-    Math.max(anchor.promptTokens, b.totalTokens) >= Math.max(100_000, minimum) &&
-    b.totalTokens / b.rawMaxTokens * 100 >= options.minPercent &&
+    b.totalTokens >= minimum &&
     hasWakeRoom(context, anchor, options.headroom);
 };

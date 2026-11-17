@@ -37,22 +37,14 @@
     "compactGuard": {
       "type": "string",
       "title": "Compact Guard",
-      "description": "Off by default. Manual keeps native compaction under user control; experimental may request native compaction before cache expiry only when all guards pass. Minimum context pressure alone never triggers compaction.",
+      "description": "Off by default. Manual may defer requested compaction for one Wake. Experimental adds a guarded idle Wake before a conservative 50-minute estimate from the last main request.",
       "default": "off",
       "options": ["off", "manual", "experimental"]
-    },
-    "compactMinPercent": {
-      "type": "number",
-      "title": "Compact minimum pressure (%)",
-      "description": "Minimum context pressure for experimental native compaction; this threshold alone never triggers compaction.",
-      "default": 80,
-      "min": 50,
-      "max": 95
     },
     "compactHeadroomTokens": {
       "type": "number",
       "title": "Compact headroom tokens",
-      "description": "Required context headroom for experimental native compaction; all other guards must also pass.",
+      "description": "Required Wake headroom below both context and auto-compaction limits, for manual and experimental modes.",
       "default": 16000,
       "min": 4096,
       "max": 100000
@@ -60,7 +52,7 @@
     "compactLeadSeconds": {
       "type": "number",
       "title": "Compact lead time (seconds)",
-      "description": "Lead time before cache expiry for experimental native compaction; all other guards must also pass.",
+      "description": "Lead time before the experimental 50-minute idle estimate. Wake scheduling also reserves its timeout budget.",
       "default": 60,
       "min": 15,
       "max": 300
@@ -68,7 +60,7 @@
     "compactWakeTimeoutSeconds": {
       "type": "number",
       "title": "Compact wake timeout (seconds)",
-      "description": "Maximum wait for the experimental native-compaction wake request; a timeout does not permit retrying compaction automatically.",
+      "description": "Wake timeout for both modes. If a submitted Wake has not started, warming pauses until it finishes or is confirmed dropped; restart Claude Code if it never starts.",
       "default": 30,
       "min": 5,
       "max": 120

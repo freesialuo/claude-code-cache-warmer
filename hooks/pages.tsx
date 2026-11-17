@@ -110,7 +110,7 @@ const configPageOf = (
         {toggleOf(elements, "compactGuard", COMPACT_GUARD_MODES, compactGuard, actions.setCompactGuard)}
       </Box>
       <Text key="compactGuard:note" dimColor>
-        Experimental native compaction; pressure alone never triggers it. Advanced thresholds: /config.
+        Experimental: guarded idle Wake before a 50-minute estimate. Advanced options: /config.
       </Text>
       {TTLS.map((ttl) => (
         <Box key={`idle:${ttl}`} flexDirection="row">

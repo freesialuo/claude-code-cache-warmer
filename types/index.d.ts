@@ -83,6 +83,8 @@ export type Anchor = {
   at: number;
   lastAt: number;
   lastMainResponseAt?: number;
+  // Request-start time of a main response that cached at least 90% of its input.
+  mainCacheAt?: number;
   // Last answered fork that read at least 90% of this prefix, at request start.
   lastForkAt?: number;
   model: string;
@@ -129,6 +131,8 @@ declare module "claude-code" {
       compactGuard: "off" | "manual" | "experimental";
       // Survives a module reload; never contains a replacement transcript.
       compactPending: { instructions?: string; trigger: string; at: number } | null;
+      // An admitted or in-flight Wake cannot be assumed cancelled by hot reload.
+      compactWake: { text: string; turnId?: string } | null;
     };
   }
 }

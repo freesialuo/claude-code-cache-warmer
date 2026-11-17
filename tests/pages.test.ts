@@ -38,7 +38,7 @@ test("Compact Guard cycles modes and saves configuration", async ($, on) => {
     });
   }
   expect(configSets).toEqual(["manual", "experimental", "off"]);
-  expect(await pane.find({ text: /Advanced thresholds: \/config\./ })).toBeDefined();
+  expect(await pane.find({ text: /Advanced options: \/config\./ })).toBeDefined();
   await pane.unmount();
 });
 

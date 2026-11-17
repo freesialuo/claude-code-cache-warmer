@@ -15,16 +15,18 @@ const contextOf = (tokens = 200_000, limit = 250_000): SessionContextUsage => ({
 
 const messages = [{ role: "assistant" as const, text: "Native summary", toolUses: [] }];
 
-const setup = (on: On) => {
+const setup = (on: On, env: Record<string, string> = {}) => {
   const worldOn = ((event: string, ...args: unknown[]) => {
-    if (event === "turn.step" || event === "fs.write") return;
+    if (event === "turn.step" || event === "turn.complete" || event === "fs.write") return;
     return (on as Function)(event, ...args);
   }) as On;
-  const w = world(worldOn, { HOME: "/home/t" });
+  const w = world(worldOn, { HOME: "/home/t", ...env });
   let usageBarrier: (() => Promise<void>) | undefined;
   let stepBarrier: (() => Promise<void>) | undefined;
   let nativeBarrier: (() => Promise<void>) | undefined;
   let submitBarrier: (() => Promise<void>) | undefined;
+  let completeBarrier: (() => Promise<void>) | undefined;
+  let dropWake = false;
   let rewriteWake: string | undefined;
   let logBarrier: { includes: string; wait: () => Promise<void> } | undefined;
   on("fs.write", async (_, e) => {
@@ -75,7 +77,14 @@ const setup = (on: On) => {
     if (submitError) throw new Error("submit unavailable");
     if (e.origin.kind === "plugin") wakes.push(rewriteWake ?? e.text);
     await wait?.();
+    if (e.origin.kind === "plugin" && dropWake) return { drop: "removed from the queue" };
     return { text: e.origin.kind === "plugin" ? rewriteWake ?? e.text : e.text, origin: e.origin };
+  });
+  on("turn.complete", async () => {
+    const wait = completeBarrier;
+    completeBarrier = undefined;
+    await wait?.();
+    return { text: "" };
   });
   const compact = ($: Engine, trigger: SessionCompactInput["trigger"] = "manual", instructions = "Keep the API contract") =>
     $.session.compact({ trigger, messages, instructions });
@@ -98,8 +107,11 @@ const setup = (on: On) => {
     holdNative: (wait: () => Promise<void>) => { nativeBarrier = wait; },
     holdLog: (includes: string, wait: () => Promise<void>) => { logBarrier = { includes, wait }; },
     holdSubmit: (wait: () => Promise<void>) => { submitBarrier = wait; },
+    holdComplete: (wait: () => Promise<void>) => { completeBarrier = wait; },
+    dropWake: () => { dropWake = true; },
     rewriteWake: (text: string) => { rewriteWake = text; },
     context: (value: SessionContextUsage) => { context = value; },
+    mainUsage: (value: TurnUsage) => { nextUsage = value; },
     usageError: () => { usageError = true; },
     idle: (value: boolean | undefined) => { idle = value; },
     submitError: () => { submitError = true; },
@@ -242,17 +254,66 @@ test("a real user prompt before queued Wake cancels Wake and preserves native fa
   expect(w.native).toHaveLength(1);
 });
 
-test("accepted queued Wake timeout does not race native compaction against a pending turn", manual, async ($, on) => {
+test("accepted queued Wake timeout retains retry instructions and never compacts after its late completion", manual, async ($, on) => {
   const w = setup(on);
   await w.stale($);
   await w.compact($);
   await w.clock.advance(31_000);
   expect(w.wakes).toHaveLength(1);
   expect(w.native).toHaveLength(0);
-  expect(w.logged.some(text => text.includes("timed out"))).toBe(true);
+  expect(w.logged.some(text => /restart Claude Code/i.test(text) && text.includes("Retry /compact Keep the API contract"))).toBe(true);
   await w.finishWake($);
-  expect(w.native).toHaveLength(1);
+  expect(w.native).toHaveLength(0);
+  const forksBefore = w.forks.length;
+  await w.clock.advance(270_000);
+  expect(w.forks).toHaveLength(forksBefore + 1);
 });
+
+test("a Wake that never starts enters recovery and blocks warming without aborting a user turn", manual, async ($, on) => {
+  const w = setup(on);
+  const aborted: string[] = [];
+  on("turn.abort", (_, e) => { aborted.push(e.turnId); return { value: undefined }; });
+  await w.stale($);
+  await w.compact($);
+  await w.clock.advance(31_000);
+  expect(w.logged.some(text => /restart Claude Code/i.test(text) && text.includes("Retry /compact Keep the API contract"))).toBe(true);
+  await $.prompt.submit({ text: "My next question", wait: false, origin: { kind: "composer" } });
+  await w.prompt($, "user-after-timeout");
+  const forksBefore = w.forks.length;
+  await w.clock.advance(10 * MINUTE);
+  expect(w.forks).toHaveLength(forksBefore);
+  expect(w.native).toHaveLength(0);
+  expect(w.wakes).toHaveLength(1);
+  expect(aborted).toHaveLength(0);
+  expect((await w.compact($, "manual", "Replacement instructions")).skip).toBeDefined();
+  expect(w.logged.some(text => text.includes("Retry /compact Keep the API contract"))).toBe(true);
+});
+
+for (const overtaker of ["native auto", "session clear"] as const) {
+  test(`late recovery Wake callbacks preserve a new user warming chain after ${overtaker}`, manual, async ($, on) => {
+    const w = setup(on);
+    const aborted: string[] = [];
+    on("turn.abort", (_, e) => { aborted.push(e.turnId); return { value: undefined }; });
+    if (overtaker === "session clear") on("session.end", (_, e) => ({ sessionId: e.sessionId }));
+    await w.stale($);
+    await w.compact($);
+    await w.clock.advance(31_000);
+    const lateText = w.wakes[0]!;
+    if (overtaker === "native auto") await w.compact($, "auto");
+    else await $.session.end({ reason: "clear", sessionId: "s-test", resume: { id: "s-test" } });
+    await w.prompt($, "new-main-after-recovery");
+    const forksBefore = w.forks.length;
+    await w.clock.advance(2 * MINUTE);
+    await $.turn.start({ text: lateText, turnId: "late-recovery-wake" });
+    for await (const _ of $.turn.step({ turnId: "late-recovery-wake", index: 0, model: OPUS, messageCount: 1 })) { /* drain */ }
+    await $.turn.complete({ answer: "ready", durationMs: 5, isAborted: false, turnId: "late-recovery-wake", reason: "answer" });
+    await w.clock.advance(150_000);
+    expect(w.forks).toHaveLength(forksBefore + 1);
+    expect(w.native).toHaveLength(overtaker === "native auto" ? 1 : 0);
+    expect(w.wakes).toHaveLength(1);
+    expect(aborted).toHaveLength(0);
+  });
+}
 
 test("native skip retains warming and reports retry without looping", manual, async ($, on) => {
   const w = setup(on);
@@ -268,24 +329,90 @@ test("native skip retains warming and reports retry without looping", manual, as
   expect(w.forks.length).toBeGreaterThan(1);
 });
 
-for (const policy of ["enabled", "disabled", "unknown", "low pressure"] as const) {
-  test(`experimental idle guard requires explicit native policy and pressure: ${policy}`, { options: { ttl: "1h", compactGuard: "experimental" } }, async ($, on) => {
+for (const policy of ["enabled", "disabled", "unknown", "below native minimum"] as const) {
+  test(`experimental idle guard respects native policy and minimum: ${policy}`, { options: { ttl: "1h", compactGuard: "experimental" } }, async ($, on) => {
     const w = setup(on);
     if (policy === "disabled") w.idle(false);
     if (policy === "unknown") w.idle(undefined);
-    if (policy === "low pressure") w.context(contextOf(150_000, 300_000));
+    if (policy === "below native minimum") {
+      w.context(contextOf(150_000, 300_000));
+      w.mainUsage(turnUsage(OPUS, 149_000, 1000));
+    }
     await start($);
     await w.prompt($, "main");
-    await w.clock.advance(58 * MINUTE);
+    await w.clock.advance(48 * MINUTE);
     expect(w.wakes).toHaveLength(0);
-    await w.clock.advance(MINUTE + 200);
-    expect(w.wakes).toHaveLength(policy === "enabled" ? 1 : 0);
-    if (policy === "enabled") {
+    await w.clock.advance(MINUTE / 2 + 200);
+    expect(w.wakes).toHaveLength(policy === "enabled" || policy === "unknown" ? 1 : 0);
+    if (policy === "enabled" || policy === "unknown") {
       await w.finishWake($);
       expect(w.native).toHaveLength(1);
     } else expect(w.native).toHaveLength(0);
   });
 }
+
+test("proactive Wake compacts before a competing native idle check at 54 minutes and before the first Fork", { options: { ttl: "1h", compactGuard: "experimental" } }, async ($, on) => {
+  const w = setup(on);
+  let idleTokens = 200_000;
+  let nativeIdleChecks = 0;
+  const nativeIdle = w.clock.sleep(54 * MINUTE).then(async () => {
+    nativeIdleChecks += 1;
+    if (idleTokens >= 200_000) await w.compact($, "auto");
+  });
+  await start($);
+  await w.prompt($, "main");
+  await w.clock.advance(48.5 * MINUTE + 200);
+  expect(w.wakes).toHaveLength(1);
+  expect(w.forks).toHaveLength(0);
+  await w.finishWake($);
+  expect(w.native).toHaveLength(1);
+  // Native idle compaction at 54 minutes sees the already-compacted summary.
+  idleTokens = 40_000;
+  w.context(contextOf(idleTokens));
+  await w.clock.advance(5.5 * MINUTE);
+  await nativeIdle;
+  expect(nativeIdleChecks).toBe(1);
+  expect(w.native).toHaveLength(1);
+  expect(w.forks).toHaveLength(0);
+});
+
+for (const tokens of [400_000, 600_000]) {
+  test(`a 1M context uses the native 500k idle minimum: ${tokens}`, { options: { ttl: "1h", compactGuard: "experimental" } }, async ($, on) => {
+    const w = setup(on, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "500000" });
+    w.context(contextOf(tokens, 1_000_000));
+    w.mainUsage(turnUsage(OPUS, tokens - 1000, 1000));
+    await start($);
+    await w.prompt($, "main");
+    await w.clock.advance(50 * MINUTE);
+    expect(w.wakes).toHaveLength(tokens >= 500_000 ? 1 : 0);
+    expect(w.forks).toHaveLength(0);
+  });
+}
+
+test("ordinary auto-compaction headroom prevents an otherwise eligible 1M idle Wake", { options: { ttl: "1h", compactGuard: "experimental" } }, async ($, on) => {
+  const w = setup(on, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "500000" });
+  const context = contextOf(600_000, 1_000_000);
+  context.breakdown!.autoCompactThreshold = 610_000;
+  w.context(context);
+  w.mainUsage(turnUsage(OPUS, 599_000, 1000));
+  await start($);
+  await w.prompt($, "main");
+  await w.clock.advance(50 * MINUTE);
+  expect(w.wakes).toHaveLength(0);
+  expect(w.native).toHaveLength(0);
+});
+
+test("enabling the experimental guard after 50 minutes never starts a late idle Wake", { options: { ttl: "1h", compactGuard: "manual" } }, async ($, on) => {
+  const w = setup(on);
+  await start($);
+  await w.prompt($, "main");
+  await w.clock.advance(51 * MINUTE);
+  await $.config.set({ key: "cache-warmer.compactGuard", value: "experimental", previous: "manual", provider: { plugin: "cache-warmer", tier: "user" }, origin: { kind: "composer" } });
+  await w.clock.advance(10 * MINUTE);
+  expect(w.wakes).toHaveLength(0);
+  expect(w.native).toHaveLength(0);
+  expect(w.forks).toHaveLength(1);
+});
 
 
 test("native API failure after Wake reports retry and never retries automatically", manual, async ($, on) => {
@@ -305,8 +432,8 @@ test("experimental pressure alone before idle deadline never submits Wake", { op
   const w = setup(on);
   await start($);
   await w.prompt($, "main");
-  await w.clock.advance(58 * MINUTE);
-  expect(w.forks).toHaveLength(1);
+  await w.clock.advance(48 * MINUTE);
+  expect(w.forks).toHaveLength(0);
   expect(w.wakes).toHaveLength(0);
   expect(w.native).toHaveLength(0);
 });
@@ -331,19 +458,20 @@ test("an unrelated completed user turn cannot resume compaction while accepted W
   await w.clock.advance(31_000);
   expect(w.native).toHaveLength(0);
   await w.finishWake($);
-  expect(w.native).toHaveLength(1);
+  expect(w.native).toHaveLength(0);
+  expect(w.logged.some(text => /restart Claude Code/i.test(text) && text.includes("Retry /compact Keep the API contract"))).toBe(true);
 });
 
 test("turning Compact Guard off cancels a queued proactive Wake", { options: { ttl: "1h", compactGuard: "experimental" } }, async ($, on) => {
   const w = setup(on);
   await start($);
   await w.prompt($, "main");
-  await w.clock.advance(59 * MINUTE);
+  await w.clock.advance(48.5 * MINUTE);
   await $.config.set({ key: "cache-warmer.compactGuard", value: "off", previous: "experimental", provider: { plugin: "cache-warmer", tier: "user" }, origin: { kind: "composer" } });
   await w.clock.advance(1000);
   expect(w.wakes).toHaveLength(0);
   expect(w.native).toHaveLength(0);
-  await w.clock.advance(49 * MINUTE);
+  await w.clock.advance(60 * MINUTE);
   expect(w.forks).toHaveLength(2);
 });
 
@@ -412,7 +540,7 @@ for (const mode of ["manual", "experimental"] as const) {
     } else {
       await start($);
       await w.prompt($, "main");
-      await w.clock.advance(59 * MINUTE + 200);
+      await w.clock.advance(48.5 * MINUTE + 200);
     }
     expect(w.wakes).toHaveLength(1);
     await $.turn.start({ text: w.wakes[0]!, turnId: "active-wake" });
@@ -596,7 +724,7 @@ test("Wake admission rechecks fork expiry after delayed second usage read", manu
   expect(w.native).toHaveLength(1);
 });
 
-test("rewritten Wake completion releases guard and preserves explicit retry instructions", manual, async ($, on) => {
+test("unidentifiable rewritten Wake requires restart and preserves explicit retry instructions", manual, async ($, on) => {
   const w = setup(on);
   await w.stale($);
   w.rewriteWake("Rewritten plugin request: reply ready");
@@ -606,11 +734,12 @@ test("rewritten Wake completion releases guard and preserves explicit retry inst
   await w.clock.advance(31_000);
   expect(w.wakes).toHaveLength(1);
   const retryReported = w.logged.some(text => text.includes("Retry /compact Keep the API contract"));
-  expect(w.native.length === 1 || retryReported).toBe(true);
+  expect(retryReported).toBe(true);
+  expect(w.native).toHaveLength(0);
   await w.prompt($, "after-rewritten-wake");
   const forksBefore = w.forks.length;
   await w.clock.advance(270_000);
-  expect(w.forks).toHaveLength(forksBefore + 1);
+  expect(w.forks).toHaveLength(forksBefore);
   expect(w.wakes).toHaveLength(1);
 });
 
@@ -725,7 +854,7 @@ test("failed proactive guard preserves a retained manual retry record", { option
   await w.prompt($, "new-main-for-proactive");
   w.idle(true);
   w.submitError();
-  await w.clock.advance(59 * MINUTE + 1000);
+  await w.clock.advance(48.5 * MINUTE + 1000);
   const logsBeforeReload = w.logged.length;
   await start($);
   expect(w.logged.slice(logsBeforeReload).some(text =>
@@ -771,4 +900,126 @@ test("completed Wake resumes requested native compaction before submit API settl
   expect(nativeWhileSubmitUnsettled).toBe(1);
   expect(w.native).toHaveLength(1);
   expect(w.wakes).toHaveLength(1);
+});
+
+for (const result of ["accepted", "dropped"] as const) {
+  test(`unsettled Wake submission times out safely before its late ${result} result`, manual, async ($, on) => {
+    const w = setup(on);
+    await w.stale($);
+    const held = gate();
+    w.holdSubmit(held.wait);
+    await w.compact($);
+    const dispatch = w.clock.advance(200);
+    await held.started;
+    await w.clock.advance(31_000);
+    expect(w.logged.some(text => /restart Claude Code/i.test(text))).toBe(true);
+    expect(w.native).toHaveLength(0);
+    if (result === "dropped") w.dropWake();
+    held.release();
+    await dispatch;
+    if (result === "accepted") await w.finishWake($);
+    await w.prompt($, "after-resolved-submission");
+    const forksBefore = w.forks.length;
+    await w.clock.advance(270_000);
+    expect(w.forks).toHaveLength(forksBefore + 1);
+    expect(w.native).toHaveLength(0);
+    expect(w.wakes).toHaveLength(1);
+  });
+}
+
+test("confirmed late queue drop after native compaction resumes the new warming chain", manual, async ($, on) => {
+  const w = setup(on);
+  await w.stale($);
+  const held = gate();
+  w.holdSubmit(held.wait);
+  await w.compact($);
+  const dispatch = w.clock.advance(200);
+  await held.started;
+  await w.clock.advance(31_000);
+  await w.compact($, "auto");
+  await w.prompt($, "after-native-compact");
+  const forksBefore = w.forks.length;
+  w.dropWake();
+  held.release();
+  await dispatch;
+  await w.clock.advance(270_000);
+  expect(w.forks).toHaveLength(forksBefore + 1);
+  expect(w.native).toHaveLength(1);
+});
+
+test("model switch during Wake completion releases exact-turn ownership without compacting again", manual, async ($, on) => {
+  const w = setup(on);
+  const aborted: string[] = [];
+  on("turn.abort", (_, e) => { aborted.push(e.turnId); return { value: undefined }; });
+  on("classic.PostModelSwitch", () => ({}));
+  await w.stale($);
+  await w.compact($);
+  await w.clock.advance(200);
+  const held = gate();
+  w.holdComplete(held.wait);
+  const finishing = w.finishWake($);
+  await held.started;
+  await $.classic.PostModelSwitch({
+    from_model: OPUS, to_model: "claude-sonnet-5-5", requested_model: "sonnet", source: "command",
+    context_tokens: 200_000, prompt_cache_warm: true, cache_ttl: "5m",
+    estimated_cache_write_usd: 0.75, pricing: "catalog",
+  });
+  held.release();
+  await finishing;
+  await w.clock.advance(31_000);
+  expect(w.native).toHaveLength(0);
+  expect(aborted).toHaveLength(0);
+  expect(w.logged.some(text => text.includes("Retry /compact Keep the API contract"))).toBe(true);
+  await w.compact($);
+  expect(w.native).toHaveLength(1);
+});
+
+test("user input during Wake reservation prevents submission after persistence settles", manual, async ($, on) => {
+  const w = setup(on);
+  const held = gate();
+  let reserved = false;
+  on("state.set", { plugin: "cache-warmer", key: "compactWake" }, async (_, e, next) => {
+    if (e.value && !reserved) {
+      reserved = true;
+      await held.wait();
+    }
+    return next(e);
+  });
+  await w.stale($);
+  await w.compact($);
+  const dispatch = w.clock.advance(200);
+  await held.started;
+  await $.prompt.submit({ text: "My question", wait: false, origin: { kind: "composer" } });
+  await w.prompt($, "user-during-reservation");
+  held.release();
+  await dispatch;
+  await w.clock.advance(1000);
+  expect(w.wakes).toHaveLength(0);
+  expect(w.native).toHaveLength(1);
+  expect(w.native[0]?.instructions).toBe("Keep the API contract");
+});
+
+test("host-persisted Wake recovery survives activation without reviving deferred compaction", manual, async ($, on) => {
+  const w = setup(on);
+  const lateText = "[cache-warmer compact guard prior-activation] Reply ready.";
+  let restored = false;
+  on("state.get", { plugin: "cache-warmer", key: "compactWake" }, (_, e, next) => {
+    if (!restored) {
+      restored = true;
+      return { value: { value: { text: lateText }, version: 0 } };
+    }
+    return next(e);
+  });
+  await start($);
+  expect(w.logged.some(text => /restart Claude Code/i.test(text))).toBe(true);
+  await w.prompt($, "main-after-reload");
+  await w.clock.advance(2 * MINUTE);
+  expect((await w.compact($)).skip).toBeDefined();
+  await $.turn.start({ text: lateText, turnId: "late-restored-wake" });
+  for await (const _ of $.turn.step({ turnId: "late-restored-wake", index: 0, model: OPUS, messageCount: 1 })) { /* drain */ }
+  await $.turn.complete({ answer: "ready", durationMs: 5, isAborted: false, turnId: "late-restored-wake", reason: "answer" });
+  await w.clock.advance(150_000);
+  expect(w.forks).toHaveLength(1);
+  expect(w.native).toHaveLength(0);
+  expect(w.wakes).toHaveLength(0);
 });

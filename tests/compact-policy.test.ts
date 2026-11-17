@@ -3,7 +3,7 @@ import type { PluginOptions, SessionContextUsage } from "claude-code";
 import type { Anchor, Ttl, Usage } from "../types";
 import {
   compactModeOf, compactOptionsOf, forkIsFresh, hasWakeRoom,
-  idlePolicyAllows, idleWakeAt, mainIsStale, readMostOf, validUsage,
+  idleCacheIsFresh, idleDeadline, idlePolicyAllows, idleWakeAt, mainIsStale, readMostOf, validUsage,
 } from "../hooks/compact";
 import { TTL_MS } from "../hooks/warmer";
 
@@ -28,21 +28,20 @@ const usageOf = (cacheRead = 90_000): Usage => ({ input: 100, output: 1, cacheRe
 
 test("compact policy defaults off and clamps finite numeric configuration", () => {
   expect(compactOptionsOf({})).toEqual({
-    mode: "off", minPercent: 80, headroom: 16_000, leadMs: 60_000, timeoutMs: 30_000,
+    mode: "off", headroom: 16_000, leadMs: 60_000, timeoutMs: 30_000,
   });
   expect(compactOptionsOf({
-    compactGuard: "manual", compactMinPercent: 1, compactHeadroomTokens: 1,
+    compactGuard: "manual", compactHeadroomTokens: 1,
     compactLeadSeconds: 1, compactWakeTimeoutSeconds: 1,
-  })).toEqual({ mode: "manual", minPercent: 50, headroom: 4096, leadMs: 15_000, timeoutMs: 5000 });
+  })).toEqual({ mode: "manual", headroom: 4096, leadMs: 15_000, timeoutMs: 5000 });
   expect(compactOptionsOf({
-    compactGuard: "experimental", compactMinPercent: 1000, compactHeadroomTokens: 1_000_000,
+    compactGuard: "experimental", compactHeadroomTokens: 1_000_000,
     compactLeadSeconds: 1000, compactWakeTimeoutSeconds: 1000,
-  })).toEqual({ mode: "experimental", minPercent: 95, headroom: 100_000, leadMs: 300_000, timeoutMs: 120_000 });
-  expect(compactOptionsOf({ compactMinPercent: 80.6, compactHeadroomTokens: 16_000.6 }).minPercent).toBe(81);
+  })).toEqual({ mode: "experimental", headroom: 100_000, leadMs: 300_000, timeoutMs: 120_000 });
   expect(compactOptionsOf({ compactHeadroomTokens: 16_000.6 }).headroom).toBe(16_001);
   for (const value of [NaN, Infinity, -Infinity, "80", null]) {
     const options = {
-      compactMinPercent: value, compactHeadroomTokens: value,
+      compactHeadroomTokens: value,
       compactLeadSeconds: value, compactWakeTimeoutSeconds: value,
     } as PluginOptions;
     expect(compactOptionsOf(options)).toEqual(compactOptionsOf({}));
@@ -81,6 +80,17 @@ test("cache-read proof needs all valid usage fields and at least ninety percent 
   for (const tokens of [0, -1, NaN, Infinity]) expect(readMostOf(usageOf(), tokens)).toBe(false);
 });
 
+test("main cache evidence protects idle work before the first Fork, but never substitutes for stale-main recovery", () => {
+  const anchor = { ...anchorOf(), lastForkAt: undefined, mainCacheAt: 1_000_000 };
+  const options = optionsOf();
+  const due = idleWakeAt(anchor, options);
+  expect(idleCacheIsFresh(anchor, due, options.timeoutMs)).toBe(true);
+  expect(forkIsFresh(anchor, due, options.timeoutMs)).toBe(false);
+  expect(idleCacheIsFresh({ ...anchor, mainCacheAt: undefined }, due, options.timeoutMs)).toBe(false);
+  expect(idleCacheIsFresh(anchor, anchor.at + TTL_MS["1h"] - options.timeoutMs, options.timeoutMs)).toBe(false);
+  expect(idleCacheIsFresh(anchor, anchor.at - 1, options.timeoutMs)).toBe(false);
+});
+
 test("Wake headroom uses the native auto threshold as well as the model and configured windows", () => {
   const anchor = anchorOf();
   const context = contextOf();
@@ -112,7 +122,7 @@ test("Wake headroom rejects absent or malformed context limits", () => {
     expect(hasWakeRoom({ ...contextOf(), window }, anchor, 16_000)).toBe(false);
 });
 
-test("proactive policy requires pressure and every explicit native-idle eligibility condition", () => {
+test("proactive policy follows native idle eligibility independently of capacity pressure", () => {
   const anchor = anchorOf();
   const context = contextOf();
   const options = optionsOf();
@@ -121,7 +131,7 @@ test("proactive policy requires pressure and every explicit native-idle eligibil
   expect(allowed()).toBe(true);
   expect(allowed(anchor, context, { ...options, mode: "off" })).toBe(false);
   expect(allowed(anchor, context, { ...options, mode: "manual" })).toBe(false);
-  for (const enabled of [undefined, false, "true", 1])
+  for (const enabled of [false, "true", 1])
     expect(idlePolicyAllows(anchor, context, options, enabled, undefined, true)).toBe(false);
   expect(allowed(anchor, context, options, true, undefined, false)).toBe(false);
   expect(allowed(anchorOf("5m"))).toBe(false);
@@ -129,10 +139,10 @@ test("proactive policy requires pressure and every explicit native-idle eligibil
   const noAuto = contextOf();
   noAuto.breakdown!.isAutoCompactEnabled = false;
   expect(allowed(anchor, noAuto)).toBe(false);
-  expect(allowed(anchor, context, { ...options, minPercent: 81 })).toBe(false);
+  expect(allowed(anchor, context, options, undefined)).toBe(true);
   expect(allowed(anchor, context, options, true, "200001")).toBe(false);
   for (const minimum of ["0", "-1", "abc", "Infinity", "200000.5", ""])
-    expect(allowed(anchor, context, options, true, minimum)).toBe(false);
+    expect(allowed(anchor, context, options, true, minimum)).toBe(true);
 });
 
 test("idle minimum has a one-hundred-thousand floor and timing stays outside the eligibility policy", () => {
@@ -145,7 +155,8 @@ test("idle minimum has a one-hundred-thousand floor and timing stays outside the
     ...context, breakdown: { ...context.breakdown!, totalTokens: 99_999 },
   }, options, true, "1", true)).toBe(false);
   expect(idlePolicyAllows(anchor, context, options, true, undefined, true)).toBe(false);
-  expect(idleWakeAt(anchor, options)).toBe(anchor.at + TTL_MS["1h"] - options.leadMs);
+  expect(idleWakeAt(anchor, options)).toBe(anchor.at + 50 * 60_000 - options.leadMs - options.timeoutMs);
+  expect(idleDeadline({ ...anchor, lastForkAt: anchor.at + 49 * 60_000 })).toBe(idleDeadline(anchor));
   // No clock argument: the orchestrator, not this pressure/eligibility predicate, checks the due time.
   expect(idlePolicyAllows(anchor, context, options, true, "100000", true)).toBe(true);
 });
